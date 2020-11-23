@@ -533,7 +533,8 @@ public class TpchMetadata
                         ImmutableBiMap.copyOf(getColumnHandles(session, table)).inverse(),
                         handle.getConstraint()
                                 .transform(TpchColumnHandle.class::cast)
-                                .transform(TpchColumnHandle::getColumnName)));
+                                .transform(TpchColumnHandle::getColumnName),
+                        true));
     }
 
     private TupleDomain<ColumnHandle> toTupleDomain(Map<TpchColumnHandle, Set<NullableValue>> predicate)

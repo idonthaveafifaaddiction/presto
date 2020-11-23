@@ -56,10 +56,13 @@ import static io.prestosql.spi.predicate.Domain.singleValue;
 import static io.prestosql.spi.type.IntegerType.INTEGER;
 import static io.prestosql.spi.type.VarcharType.VARCHAR;
 import static io.prestosql.sql.planner.LogicalPlanner.Stage.OPTIMIZED_AND_VALIDATED;
+import static io.prestosql.sql.planner.assertions.PlanMatchPattern.expression;
 import static io.prestosql.sql.planner.assertions.PlanMatchPattern.filter;
 import static io.prestosql.sql.planner.assertions.PlanMatchPattern.output;
+import static io.prestosql.sql.planner.assertions.PlanMatchPattern.project;
 import static io.prestosql.sql.planner.assertions.PlanMatchPattern.tableScan;
 import static io.prestosql.testing.TestingSession.testSessionBuilder;
+import static io.prestosql.tests.BogusType.BOGUS;
 import static io.prestosql.transaction.TransactionBuilder.transaction;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -84,6 +87,7 @@ public class TestTableScanRedirectionWithPushdown
     private static final ColumnHandle destinationColumnHandleA = new MockConnectorColumnHandle(destinationColumnNameA, INTEGER);
     private static final String destinationColumnNameB = "destination_col_b";
     private static final ColumnHandle destinationColumnHandleB = new MockConnectorColumnHandle(destinationColumnNameB, INTEGER);
+    private static final String destinationColumnNameC = "destination_col_c";
 
     private static final Map<ColumnHandle, String> redirectionMappingA = ImmutableMap.of(sourceColumnHandleA, destinationColumnNameA);
 
@@ -94,6 +98,10 @@ public class TestTableScanRedirectionWithPushdown
     private static final Map<ColumnHandle, String> typeMismatchedRedirectionMappingBC = ImmutableMap.of(
             sourceColumnHandleB, destinationColumnNameB,
             sourceColumnHandleC, destinationColumnNameA);
+
+    private static final Map<ColumnHandle, String> bogusRedirectionMappingBC = ImmutableMap.of(
+            sourceColumnHandleB, destinationColumnNameB,
+            sourceColumnHandleC, destinationColumnNameC);
 
     @Test
     public void testRedirectionAfterProjectionPushdown()
@@ -138,7 +146,7 @@ public class TestTableScanRedirectionWithPushdown
         // make the mock connector return a table scan on destination table only if
         // the connector can detect a filter
         try (LocalQueryRunner queryRunner = createLocalQueryRunner(
-                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingA, Optional.empty()),
+                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingA, Optional.empty(), false),
                 Optional.empty(),
                 Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleA, destinationColumnHandleA))))) {
             assertPlan(
@@ -164,7 +172,7 @@ public class TestTableScanRedirectionWithPushdown
     public void testPredicatePushdownAfterRedirect()
     {
         try (LocalQueryRunner queryRunner = createLocalQueryRunner(
-                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingAB, Optional.empty()),
+                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingAB, Optional.empty(), false),
                 Optional.empty(),
                 Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleA, destinationColumnHandleB))))) {
             // Only 'source_col_a = 1' will get pushed down into source table scan
@@ -191,7 +199,7 @@ public class TestTableScanRedirectionWithPushdown
     public void testRedirectAfterColumnPruningOnPushedDownPredicate()
     {
         try (LocalQueryRunner queryRunner = createLocalQueryRunner(
-                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingAB, Optional.of(ImmutableSet.of(sourceColumnHandleB))),
+                getMockApplyRedirectAfterPredicatePushdown(redirectionMappingAB, Optional.of(ImmutableSet.of(sourceColumnHandleB)), false),
                 Optional.of(this::mockApplyProjection),
                 Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleA, destinationColumnHandleA))))) {
             // After 'source_col_a = 1' is pushed into source table scan, it's possible for 'source_col_a' table scan assignment to be pruned
@@ -215,7 +223,54 @@ public class TestTableScanRedirectionWithPushdown
     public void testPredicateTypeMismatch()
     {
         try (LocalQueryRunner queryRunner = createLocalQueryRunner(
-                getMockApplyRedirectAfterPredicatePushdown(typeMismatchedRedirectionMappingBC, Optional.of(ImmutableSet.of(sourceColumnHandleB))),
+                getMockApplyRedirectAfterPredicatePushdown(typeMismatchedRedirectionMappingBC, Optional.of(ImmutableSet.of(sourceColumnHandleB)), false),
+                Optional.of(this::mockApplyProjection),
+                Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleC))))) {
+            // After 'source_col_c = 1' is pushed into source table scan, it's possible for 'source_col_c' table scan assignment to be pruned
+            // Redirection results in Project('dest_col_b') -> Filter('dest_col_c = 1') -> TableScan for such case
+            // but dest_col_c has mismatched type compared to source domain
+            transaction(queryRunner.getTransactionManager(), queryRunner.getAccessControl())
+                    .execute(MOCK_SESSION, session -> {
+                        assertThatThrownBy(() -> queryRunner.createPlan(session, "SELECT source_col_b FROM test_table WHERE source_col_c = 'foo'", WarningCollector.NOOP))
+                                .isInstanceOf(PrestoException.class)
+                                .hasMessageMatching("Redirected column mock_catalog.target_schema.target_table.destination_col_a has type integer, different from source column .*MockConnectorTableHandle.*source_col_c.* type: varchar");
+                    });
+        }
+    }
+
+    @Test
+    public void testPredicateTypeWithCoercion()
+    {
+        try (LocalQueryRunner queryRunner = createLocalQueryRunner(
+                getMockApplyRedirectAfterPredicatePushdown(typeMismatchedRedirectionMappingBC, Optional.of(ImmutableSet.of(sourceColumnHandleB)), true),
+                Optional.of(this::mockApplyProjection),
+                Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleC))))) {
+            // After 'source_col_c = 1' is pushed into source table scan, it's possible for 'source_col_c' table scan assignment to be pruned
+            // Redirection results in Project('dest_col_b') -> Filter('dest_col_c = 1') -> TableScan for such case
+            // but dest_col_a has mismatched type compared to source domain
+            assertPlan(
+                    queryRunner,
+                    "SELECT source_col_b FROM test_table WHERE source_col_c = 'foo'",
+                    output(
+                            ImmutableList.of("DEST_COL_B"),
+                            project(ImmutableMap.of("DEST_COL_B", expression("DEST_COL_B")),
+                                    filter("CAST(DEST_COL_A AS VARCHAR) = CAST('foo' AS VARCHAR)",
+                                            tableScan(
+                                                    equalTo(new MockConnectorTableHandle(destinationTable)),
+                                                    // PushProjectionIntoTableScan does not preserve enforced constraint
+                                                    // (issue: https://github.com/prestosql/presto/issues/6029)
+                                                    TupleDomain.all(),
+                                                    ImmutableMap.of(
+                                                            "DEST_COL_B", equalTo(destinationColumnHandleB),
+                                                            "DEST_COL_A", equalTo(destinationColumnHandleA)))))));
+        }
+    }
+
+    @Test
+    public void testPredicateTypeMismatchWithMissingCoercion()
+    {
+        try (LocalQueryRunner queryRunner = createLocalQueryRunner(
+                getMockApplyRedirectAfterPredicatePushdown(bogusRedirectionMappingBC, Optional.of(ImmutableSet.of(sourceColumnHandleB)), true),
                 Optional.of(this::mockApplyProjection),
                 Optional.of(getMockApplyFilter(ImmutableSet.of(sourceColumnHandleC))))) {
             // After 'source_col_c = 1' is pushed into source table scan, it's possible for 'source_col_c' table scan assignment to be pruned
@@ -225,7 +280,7 @@ public class TestTableScanRedirectionWithPushdown
                     .execute(MOCK_SESSION, session -> {
                         assertThatThrownBy(() -> queryRunner.createPlan(session, "SELECT source_col_b FROM test_table WHERE source_col_c = 'foo'", WarningCollector.NOOP))
                                 .isInstanceOf(PrestoException.class)
-                                .hasMessageMatching("Redirected column mock_catalog.target_schema.target_table.destination_col_a has type integer, different from source column .*MockConnectorTableHandle.*source_col_c.* type: varchar");
+                                .hasMessageMatching("Cast not possible from redirected column mock_catalog.target_schema.target_table.destination_col_c with type Bogus to source column .*MockConnectorTableHandle.*source_col_c.* with type: varchar");
                     });
         }
     }
@@ -248,7 +303,8 @@ public class TestTableScanRedirectionWithPushdown
                     else if (name.equals(destinationTable)) {
                         return ImmutableList.of(
                                 new ColumnMetadata(destinationColumnNameA, INTEGER),
-                                new ColumnMetadata(destinationColumnNameB, INTEGER));
+                                new ColumnMetadata(destinationColumnNameB, INTEGER),
+                                new ColumnMetadata(destinationColumnNameC, BOGUS));
                     }
                     throw new IllegalArgumentException();
                 })
@@ -338,7 +394,8 @@ public class TestTableScanRedirectionWithPushdown
 
     private ApplyTableScanRedirect getMockApplyRedirectAfterPredicatePushdown(
             Map<ColumnHandle, String> redirectionMapping,
-            Optional<Set<ColumnHandle>> requiredProjections)
+            Optional<Set<ColumnHandle>> requiredProjections,
+            boolean allowCoercions)
     {
         return (session, handle) -> {
             MockConnectorTableHandle mockConnectorTable = (MockConnectorTableHandle) handle;
@@ -357,7 +414,8 @@ public class TestTableScanRedirectionWithPushdown
                             redirectionMapping,
                             mockConnectorTable.getConstraint()
                                     .transform(MockConnectorColumnHandle.class::cast)
-                                    .transform(redirectionMapping::get)));
+                                    .transform(redirectionMapping::get),
+                            allowCoercions));
         };
     }
 
