@@ -177,22 +177,23 @@ public class WorkProcessorPipelineSourceOperator
                     operatorFactory.getOperatorType(),
                     operatorMemoryTrackingContext));
             pages = operator.getOutputPages();
+            if (i == operatorFactories.size() - 1) {
+                // materialize pipeline output pages as there are no semantics guarantees for non WorkProcessor operators
+                pages = pages.map(Page::getLoadedPage);
+                pages = pages.transformProcessor(processor -> mergePages(
+                        outputTypes,
+                        minOutputPageSize.toBytes(),
+                        minOutputPageRowCount,
+                        maxSmallPagesRowRatio,
+                        processor,
+                        operatorContext.aggregateUserMemoryContext()));
+            }
             pages = pages
                     .yielding(() -> operatorContext.getDriverContext().getYieldSignal().isSet())
                     .withProcessEntryMonitor(() -> workProcessorOperatorEntryMonitor(operatorIndex))
                     .withProcessStateMonitor(state -> workProcessorOperatorStateMonitor(state, operatorIndex));
             pages = pages.map(page -> recordProcessedOutput(page, operatorIndex));
         }
-
-        // materialize output pages as there are no semantics guarantees for non WorkProcessor operators
-        pages = pages.map(Page::getLoadedPage);
-        pages = pages.transformProcessor(processor -> mergePages(
-                outputTypes,
-                minOutputPageSize.toBytes(),
-                minOutputPageRowCount,
-                maxSmallPagesRowRatio,
-                processor,
-                operatorContext.aggregateUserMemoryContext()));
 
         // finish early when entire pipeline is closed
         this.pages = pages.finishWhen(() -> operatorFinishing);
